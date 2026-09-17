@@ -3,7 +3,9 @@ import logging
 import os
 import urllib.request
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from statistics import median
+from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify
 from google.cloud import firestore
@@ -26,10 +28,45 @@ PREDICTIONS = "v2_predictions"
 STATE = "v2_system_state"
 
 db = firestore.Client()
+BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
 
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_time(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def brazil_time(value):
+    parsed = parse_time(value)
+    if parsed is None:
+        return "horário ainda não identificado"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(BRAZIL_TZ).strftime("%d/%m/%Y às %H:%M:%S")
+
+
+def estimate_next_time(history):
+    times = [parse_time(item.get("created_at")) for item in history[-30:]]
+    times = [value for value in times if value is not None]
+    intervals = []
+    for previous, current in zip(times, times[1:]):
+        seconds = (current - previous).total_seconds()
+        if 1 <= seconds <= 600:
+            intervals.append(seconds)
+    interval = median(intervals[-15:]) if intervals else 60
+    latest = times[-1] if times else datetime.now(timezone.utc)
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=timezone.utc)
+    expected = latest + timedelta(seconds=interval)
+    return expected.isoformat(), round(interval, 2)
 
 
 def fetch_jonbet():
@@ -157,6 +194,9 @@ def make_prediction(history):
     predicted_roll, roll_hits = roll_counter.most_common(1)[0]
     predicted_color, color_hits = color_counter.most_common(1)[0]
 
+    predicted_for, estimated_interval = estimate_next_time(history)
+    latest_round = history[-1]
+
     return {
         "predicted_roll": predicted_roll,
         "predicted_color": predicted_color,
@@ -169,6 +209,11 @@ def make_prediction(history):
         "color_sample_size": len(color_candidates),
         "roll_method": roll_method,
         "color_method": color_method,
+        "based_on_round_id": latest_round.get("id"),
+        "based_on_round_created_at": latest_round.get("created_at"),
+        "predicted_for": predicted_for,
+        "predicted_for_display": brazil_time(predicted_for),
+        "estimated_interval_seconds": estimated_interval,
         "created_at": utc_now(),
         "resolved": False,
     }
@@ -189,6 +234,8 @@ def resolve_pending_prediction(new_rounds):
         "actual_color_name": color_name(actual.get("color")),
         "roll_correct": prediction.get("predicted_roll") == actual.get("roll"),
         "color_correct": prediction.get("predicted_color") == actual.get("color"),
+        "actual_created_at": actual.get("created_at"),
+        "actual_created_at_display": brazil_time(actual.get("created_at")),
         "resolved_at": utc_now(),
     }
     document.reference.update(result)
@@ -282,6 +329,16 @@ def prediction_stats():
     }
 
 
+def recent_predictions(limit=10):
+    documents = (
+        db.collection(PREDICTIONS)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+        .get()
+    )
+    return [document.to_dict() for document in documents]
+
+
 def state_data():
     document = db.collection(STATE).document("main").get()
     return document.to_dict() if document.exists else {}
@@ -292,6 +349,7 @@ def home():
     try:
         total = get_round_count()
         stats = prediction_stats()
+        recent = recent_predictions()
         _, current = pending_prediction()
         state = state_data()
         progress = min(100, round(total / MIN_HISTORY * 100, 1))
@@ -302,6 +360,7 @@ def home():
             )
         elif current:
             estimate = f"""
+            <p class="target">Previsão para <strong>{current.get('predicted_for_display', brazil_time(current.get('predicted_for')))}</strong></p>
             <div class="prediction-grid">
               <div><span>Próxima cor estimada</span><strong>{current.get('predicted_color_name')}</strong><small>{current.get('color_confidence')}% de frequência na amostra</small></div>
               <div><span>Próximo número estimado</span><strong>{current.get('predicted_roll')}</strong><small>{current.get('roll_confidence')}% de frequência na amostra</small></div>
@@ -310,6 +369,28 @@ def home():
             """
         else:
             estimate = "<p>Nenhuma estimativa pendente. Execute uma coleta para tentar criá-la.</p>"
+
+        history_cards = []
+        for item in recent:
+            if not item.get("resolved"):
+                status = '<span class="badge waiting">Aguardando resultado</span>'
+                actual_text = "Resultado real ainda não chegou."
+            else:
+                color_status = "ACERTOU" if item.get("color_correct") else "ERROU"
+                roll_status = "ACERTOU" if item.get("roll_correct") else "ERROU"
+                status = '<span class="badge done">Conferida</span>'
+                actual_text = (
+                    f"Real: {item.get('actual_color_name')} — número {item.get('actual_roll')} "
+                    f"({item.get('actual_created_at_display', brazil_time(item.get('actual_created_at')))})<br>"
+                    f"Cor: <strong>{color_status}</strong> · Número: <strong>{roll_status}</strong>"
+                )
+            target = item.get("predicted_for_display", brazil_time(item.get("predicted_for")))
+            history_cards.append(
+                f'<div class="history-item">{status}<strong>{target}</strong><br>'
+                f'Previsão: {item.get("predicted_color_name")} — número {item.get("predicted_roll")}<br>'
+                f'<span>{actual_text}</span></div>'
+            )
+        history_html = "".join(history_cards) or "<p>Nenhuma previsão criada ainda.</p>"
 
         return f"""<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -322,6 +403,8 @@ main{{max-width:760px;margin:auto;padding:26px 18px 50px}} h1{{font-size:2.2rem;
 .prediction-grid,.stats{{display:grid;grid-template-columns:1fr 1fr;gap:14px}} .prediction-grid div,.stats div{{background:#f5f2ff;padding:17px;border-radius:15px}}
 .prediction-grid span,.prediction-grid small{{display:block}} .prediction-grid strong{{display:block;font-size:1.55rem;margin:6px 0;text-transform:capitalize}}
 .stats strong{{font-size:1.5rem}} a{{display:block;color:var(--accent);font-weight:650;margin:14px 0}} .ok{{color:var(--ok)}}
+.target{{font-size:1.12rem;background:#fff4cf;padding:14px;border-radius:14px}} .history-item{{border-top:1px solid #e3e5e8;padding:16px 0;line-height:1.55}} .history-item:first-child{{border-top:0}}
+.badge{{display:inline-block;font-size:.78rem;padding:4px 9px;border-radius:20px;margin-right:8px}} .waiting{{background:#fff0bd;color:#775600}} .done{{background:#dff5e8;color:#12633a}}
 @media(max-width:520px){{h1{{font-size:1.8rem}}.card{{padding:22px}}.prediction-grid,.stats{{grid-template-columns:1fr}}}}
 </style></head><body><main>
 <h1>Monitor de Resultados V2</h1><p class="subtitle">Coleta, estimativas e conferência automática.</p>
@@ -329,6 +412,7 @@ main{{max-width:760px;margin:auto;padding:26px 18px 50px}} h1{{font-size:2.2rem;
 <section class="card"><h2>Coleta automática</h2><p class="ok">Sistema online</p><p>Última coleta: <strong>{state.get('last_collection','ainda não executada')}</strong></p><p>Novos resultados: <strong>{state.get('last_new_rounds',0)}</strong></p></section>
 <section class="card"><h2>Estimativa</h2>{estimate}<p class="muted">Estimativas estatísticas não garantem resultados futuros.</p></section>
 <section class="card"><h2>Desempenho real</h2><p>Previsões conferidas: <strong>{stats['predictions_resolved']}</strong></p><div class="stats"><div>Cor<br><strong>{stats['color_accuracy']}%</strong><br>{stats['color_hits']} acertos / {stats['color_errors']} erros</div><div>Número<br><strong>{stats['roll_accuracy']}%</strong><br>{stats['roll_hits']} acertos / {stats['roll_errors']} erros</div></div></section>
+<section class="card"><h2>Histórico das previsões</h2>{history_html}</section>
 <section class="card"><h2>Ferramentas</h2><a href="/api/collect">Executar coleta agora</a><a href="/api/stats">Estatísticas em JSON</a><a href="/api/state">Estado do coletor</a><a href="/api/verify">Verificar sistema</a><a href="/api/rounds">Resultados atuais da fonte</a></section>
 </main></body></html>"""
     except Exception as error:
