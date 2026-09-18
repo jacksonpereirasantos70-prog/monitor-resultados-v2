@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import threading
+import time
 import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -29,6 +31,10 @@ STATE = "v2_system_state"
 
 db = firestore.Client()
 BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
+STATS_CACHE_LOCK = threading.Lock()
+STATS_CACHE = None
+STATS_CACHE_AT = 0.0
+STATS_CACHE_SECONDS = max(5, int(os.getenv("STATS_CACHE_SECONDS", "15")))
 
 
 def utc_now():
@@ -329,6 +335,17 @@ def prediction_stats():
     }
 
 
+def cached_prediction_stats(force=False):
+    global STATS_CACHE, STATS_CACHE_AT
+    now = time.monotonic()
+    with STATS_CACHE_LOCK:
+        if not force and STATS_CACHE is not None and now - STATS_CACHE_AT < STATS_CACHE_SECONDS:
+            return dict(STATS_CACHE)
+        STATS_CACHE = prediction_stats()
+        STATS_CACHE_AT = now
+        return dict(STATS_CACHE)
+
+
 def recent_predictions(limit=10):
     documents = (
         db.collection(PREDICTIONS)
@@ -452,7 +469,7 @@ def api_stats():
             minimum_history=MIN_HISTORY,
             prediction_enabled=total >= MIN_HISTORY,
             current_prediction=current,
-            performance=prediction_stats(),
+            performance=cached_prediction_stats(),
         )
     except Exception as error:
         return jsonify(success=False, error=str(error)), 500
