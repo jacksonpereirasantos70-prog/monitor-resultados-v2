@@ -361,6 +361,65 @@ def state_data():
     return document.to_dict() if document.exists else {}
 
 
+def timing_analysis(limit=HISTORY_LIMIT):
+    history = get_history(limit)
+    rows = []
+    for item in history:
+        created = parse_time(item.get("created_at"))
+        roll = item.get("roll")
+        if created is None or not isinstance(roll, int):
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        rows.append((created, roll, item.get("color")))
+    rows.sort(key=lambda row: row[0])
+
+    number_counts = Counter(row[1] for row in rows)
+    second_counts = Counter(row[0].second for row in rows)
+    parity_counts = Counter("par" if row[0].second % 2 == 0 else "ímpar" for row in rows)
+    interval_counts = Counter()
+    for previous, current in zip(rows, rows[1:]):
+        seconds = round((current[0] - previous[0]).total_seconds())
+        if 0 < seconds <= 600:
+            interval_counts[seconds] += 1
+
+    by_second = {}
+    for second in sorted(second_counts):
+        rolls = Counter(row[1] for row in rows if row[0].second == second)
+        by_second[f"{second:02d}"] = {
+            "total": second_counts[second],
+            "top_numbers": [
+                {"number": number, "count": count, "percentage": round(count / second_counts[second] * 100, 2)}
+                for number, count in rolls.most_common(5)
+            ],
+        }
+
+    total = len(rows)
+    return {
+        "analyzed_rounds": total,
+        "first_created_at": rows[0][0].isoformat() if rows else None,
+        "last_created_at": rows[-1][0].isoformat() if rows else None,
+        "number_frequency": [
+            {"number": number, "count": count, "percentage": round(count / total * 100, 2)}
+            for number, count in number_counts.most_common()
+        ] if total else [],
+        "second_frequency": [
+            {"second": f"{second:02d}", "count": count, "percentage": round(count / total * 100, 2)}
+            for second, count in second_counts.most_common()
+        ] if total else [],
+        "second_parity": {
+            key: {"count": count, "percentage": round(count / total * 100, 2)}
+            for key, count in parity_counts.items()
+        } if total else {},
+        "interval_frequency_seconds": [
+            {"seconds": seconds, "count": count}
+            for seconds, count in interval_counts.most_common(10)
+        ],
+        "numbers_by_second": by_second,
+        "note": "Horário e frequência descrevem o histórico; não garantem o próximo resultado.",
+    }
+
+
 @app.route("/")
 def home():
     try:
@@ -500,6 +559,15 @@ def api_verify():
             current_prediction=current,
         )
     except Exception as error:
+        return jsonify(success=False, error=str(error)), 500
+
+
+@app.route("/api/analysis/timing")
+def api_timing_analysis():
+    try:
+        return jsonify(success=True, service="monitor-resultados-v2", analysis=timing_analysis())
+    except Exception as error:
+        logger.exception("Falha na análise temporal")
         return jsonify(success=False, error=str(error)), 500
 
 
