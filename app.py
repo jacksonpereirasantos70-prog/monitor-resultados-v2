@@ -410,6 +410,32 @@ def calibration_analysis():
     }
 
 
+def prediction_history_export():
+    fields = (
+        "prediction_id", "created_at", "predicted_for", "history_size",
+        "predicted_color", "predicted_color_name", "color_confidence", "color_method",
+        "predicted_roll", "roll_confidence", "roll_method", "resolved",
+        "actual_round_id", "actual_created_at", "actual_color", "actual_color_name",
+        "actual_roll", "color_correct", "roll_correct", "resolved_at",
+    )
+    rows = []
+    for document in db.collection(PREDICTIONS).where("resolved", "==", True).get():
+        item = document.to_dict()
+        row = {field: item.get(field) for field in fields}
+        row["prediction_id"] = row.get("prediction_id") or document.id
+        row["predicted_color_name"] = (
+            "preto" if row.get("predicted_color_name") == "escuro"
+            else row.get("predicted_color_name")
+        )
+        row["actual_color_name"] = (
+            "preto" if row.get("actual_color_name") == "escuro"
+            else row.get("actual_color_name")
+        )
+        rows.append(row)
+    rows.sort(key=lambda row: row.get("actual_created_at") or row.get("resolved_at") or "")
+    return rows
+
+
 def cached_prediction_stats(force=False):
     global STATS_CACHE, STATS_CACHE_AT
     now = time.monotonic()
@@ -652,6 +678,16 @@ def api_calibration_analysis():
         return jsonify(success=True, service="monitor-resultados-v2", analysis=calibration_analysis())
     except Exception as error:
         logger.exception("Falha na análise de calibração")
+        return jsonify(success=False, error=str(error)), 500
+
+
+@app.route("/api/analysis/predictions")
+def api_prediction_history():
+    try:
+        rows = prediction_history_export()
+        return jsonify(success=True, service="monitor-resultados-v2", total=len(rows), predictions=rows)
+    except Exception as error:
+        logger.exception("Falha na exportação do histórico de previsões")
         return jsonify(success=False, error=str(error)), 500
 
 
