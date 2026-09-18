@@ -335,6 +335,81 @@ def prediction_stats():
     }
 
 
+def calibration_analysis():
+    """Group every resolved prediction by the percentage shown to the user."""
+    resolved = [
+        document.to_dict()
+        for document in db.collection(PREDICTIONS).where("resolved", "==", True).get()
+    ]
+
+    def percentage(value):
+        try:
+            return round(float(value), 2)
+        except (TypeError, ValueError):
+            return None
+
+    def normalized_color(value):
+        name = str(value if value is not None else "desconhecido").lower()
+        return "preto" if name in ("escuro", "preto") else name
+
+    color_groups = {}
+    number_groups = {}
+    for item in resolved:
+        color_confidence = percentage(item.get("color_confidence"))
+        if color_confidence is not None:
+            predicted = normalized_color(item.get("predicted_color_name"))
+            key = (predicted, color_confidence)
+            group = color_groups.setdefault(
+                key,
+                {"cor_prevista": predicted, "porcentagem": color_confidence,
+                 "aparicoes": 0, "acertos": 0, "erros": 0,
+                 "resultados_reais": Counter()},
+            )
+            group["aparicoes"] += 1
+            hit = item.get("color_correct") is True
+            group["acertos"] += int(hit)
+            group["erros"] += int(not hit)
+            group["resultados_reais"][normalized_color(item.get("actual_color_name"))] += 1
+
+        roll_confidence = percentage(item.get("roll_confidence"))
+        predicted_roll = item.get("predicted_roll")
+        if roll_confidence is not None and predicted_roll is not None:
+            key = (str(predicted_roll), roll_confidence)
+            group = number_groups.setdefault(
+                key,
+                {"numero_previsto": predicted_roll, "porcentagem": roll_confidence,
+                 "aparicoes": 0, "acertos": 0, "erros": 0,
+                 "resultados_reais": Counter()},
+            )
+            group["aparicoes"] += 1
+            hit = item.get("roll_correct") is True
+            group["acertos"] += int(hit)
+            group["erros"] += int(not hit)
+            group["resultados_reais"][str(item.get("actual_roll"))] += 1
+
+    def finish(groups):
+        rows = []
+        for group in groups.values():
+            total = group["aparicoes"]
+            group["taxa_real_de_acerto"] = round(group["acertos"] / total * 100, 2)
+            group["resultados_reais"] = dict(
+                sorted(group["resultados_reais"].items(), key=lambda pair: (-pair[1], pair[0]))
+            )
+            rows.append(group)
+        return rows
+
+    colors = finish(color_groups)
+    numbers = finish(number_groups)
+    colors.sort(key=lambda row: (row["cor_prevista"], row["porcentagem"]))
+    numbers.sort(key=lambda row: (str(row["numero_previsto"]), row["porcentagem"]))
+    return {
+        "previsoes_conferidas": len(resolved),
+        "cores": colors,
+        "numeros": numbers,
+        "descricao": "Cada linha reúne uma cor ou número previsto e a porcentagem exata exibida.",
+    }
+
+
 def cached_prediction_stats(force=False):
     global STATS_CACHE, STATS_CACHE_AT
     now = time.monotonic()
@@ -568,6 +643,15 @@ def api_timing_analysis():
         return jsonify(success=True, service="monitor-resultados-v2", analysis=timing_analysis())
     except Exception as error:
         logger.exception("Falha na análise temporal")
+        return jsonify(success=False, error=str(error)), 500
+
+
+@app.route("/api/analysis/calibration")
+def api_calibration_analysis():
+    try:
+        return jsonify(success=True, service="monitor-resultados-v2", analysis=calibration_analysis())
+    except Exception as error:
+        logger.exception("Falha na análise de calibração")
         return jsonify(success=False, error=str(error)), 500
 
 
