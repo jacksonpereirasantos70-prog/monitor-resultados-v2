@@ -31,7 +31,14 @@ STATE = "v2_system_state"
 
 db = firestore.Client()
 BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
-PREDICTION_INTERVAL_SECONDS = 60
+COLLECT_INTERVAL_SECONDS = max(3.0, float(os.getenv("COLLECT_INTERVAL_SECONDS", "5")))
+DEFAULT_ROUND_INTERVAL_SECONDS = float(os.getenv("ROUND_INTERVAL_SECONDS", "30.081"))
+MAX_BACKFILL_PAGES = max(1, min(50, int(os.getenv("MAX_BACKFILL_PAGES", "20"))))
+STALE_AFTER_SECONDS = max(45.0, float(os.getenv("STALE_AFTER_SECONDS", "75")))
+MAX_TARGET_LAG_SECONDS = max(5.0, float(os.getenv("MAX_TARGET_LAG_SECONDS", "15")))
+BACKGROUND_COLLECTOR = os.getenv("BACKGROUND_COLLECTOR", "true").lower() in ("1", "true", "yes", "on")
+COLLECT_LOCK = threading.Lock()
+COLLECTOR_STARTED = False
 STATS_CACHE_LOCK = threading.Lock()
 STATS_CACHE = None
 STATS_CACHE_AT = 0.0
@@ -60,7 +67,10 @@ def prediction_timing_valid(item):
     target = parse_time(item.get("predicted_for"))
     if created is None or actual is None or actual <= created:
         return False
-    return target is None or actual >= target - timedelta(seconds=5)
+    if target is None:
+        return True
+    offset = (actual - target).total_seconds()
+    return -5 <= offset <= MAX_TARGET_LAG_SECONDS
 
 
 def brazil_time(value):
@@ -73,19 +83,68 @@ def brazil_time(value):
 
 
 def estimate_next_time(history):
-    times = [parse_time(item.get("created_at")) for item in history[-30:]]
-    times = [value for value in times if value is not None]
+    times = [parse_time(item.get("created_at")) for item in history[-60:]]
+    times = sorted({value for value in times if value is not None})
     latest = times[-1] if times else datetime.now(timezone.utc)
-    expected = latest + timedelta(seconds=PREDICTION_INTERVAL_SECONDS)
-    return expected.isoformat(), PREDICTION_INTERVAL_SECONDS
+    intervals = [
+        (current - previous).total_seconds()
+        for previous, current in zip(times, times[1:])
+        if 20 <= (current - previous).total_seconds() <= 45
+    ]
+    interval = median(intervals[-40:]) if intervals else DEFAULT_ROUND_INTERVAL_SECONDS
+    interval = round(min(35.0, max(25.0, interval)), 3)
+    expected = latest + timedelta(seconds=interval)
+    return expected.isoformat(), interval
 
-def fetch_jonbet():
+def jonbet_page_url(page):
+    base, separator, tail = JONBET_URL.rpartition("/")
+    return f"{base}/{page}" if separator and tail.isdigit() else JONBET_URL
+
+
+def fetch_jonbet_page(page=1):
     request = urllib.request.Request(
-        JONBET_URL,
+        jonbet_page_url(page),
         headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return response.status, json.loads(response.read().decode("utf-8"))
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except Exception as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+    raise last_error
+
+
+def fetch_jonbet():
+    return fetch_jonbet_page(1)
+
+
+def fetch_jonbet_history(last_round_id=None):
+    """Fetch pages until the last stored round is reached after an outage."""
+    combined = []
+    seen = set()
+    source_status = None
+    reached_last_known = last_round_id is None
+    pages_fetched = 0
+    for page in range(1, MAX_BACKFILL_PAGES + 1):
+        source_status, payload = fetch_jonbet_page(page)
+        pages_fetched += 1
+        page_rounds = extract_rounds(payload)
+        if not page_rounds:
+            break
+        for item in page_rounds:
+            round_id = str(item.get("id")) if item.get("id") is not None else None
+            if round_id == last_round_id:
+                reached_last_known = True
+            if round_id and round_id not in seen:
+                seen.add(round_id)
+                combined.append(item)
+        if reached_last_known or last_round_id is None:
+            break
+    return source_status, combined, pages_fetched, reached_last_known
 
 
 def extract_rounds(data):
@@ -134,18 +193,38 @@ def get_history(limit=HISTORY_LIMIT):
     return history
 
 
-def pending_prediction():
-    documents = (
-        db.collection(PREDICTIONS)
-        .where("resolved", "==", False)
-        .limit(1)
-        .get()
+def get_latest_round():
+    history = get_history(limit=1)
+    return history[-1] if history else None
+
+
+def freshness_snapshot():
+    latest = get_latest_round()
+    actual_time = parse_time(latest.get("created_at")) if latest else None
+    age = (
+        round((datetime.now(timezone.utc) - actual_time).total_seconds(), 3)
+        if actual_time is not None else None
     )
+    fresh = age is not None and age <= STALE_AFTER_SECONDS
+    return {
+        "fresh": fresh,
+        "status": "ok" if fresh else "stale",
+        "last_round_id": latest.get("id") if latest else None,
+        "last_round_created_at": latest.get("created_at") if latest else None,
+        "seconds_since_last_round": age,
+        "stale_after_seconds": STALE_AFTER_SECONDS,
+        "collector_interval_seconds": COLLECT_INTERVAL_SECONDS,
+    }
+
+
+def pending_prediction():
+    documents = db.collection(PREDICTIONS).where("resolved", "==", False).get()
     if not documents:
         return None, None
-    data = documents[0].to_dict()
-    data["prediction_id"] = documents[0].id
-    return documents[0], data
+    document = max(documents, key=lambda item: item.to_dict().get("created_at") or "")
+    data = document.to_dict()
+    data["prediction_id"] = document.id
+    return document, data
 
 
 def make_prediction(history):
@@ -249,6 +328,8 @@ def resolve_pending_prediction(new_rounds):
         # Aceita pequena tolerância do relógio da fonte, mas mantém o alvo de 1 minuto.
         if predicted_for is not None and actual_time < predicted_for - timedelta(seconds=5):
             continue
+        if predicted_for is not None and actual_time > predicted_for + timedelta(seconds=MAX_TARGET_LAG_SECONDS):
+            continue
         candidates.append((actual_time, candidate))
 
     if not candidates:
@@ -275,7 +356,7 @@ def resolve_pending_prediction(new_rounds):
         "actual_created_at_display": brazil_time(actual.get("created_at")),
         "lead_time_seconds": lead_time,
         "target_offset_seconds": target_offset,
-        "timing_valid": True,
+        "timing_valid": target_offset is None or -5 <= target_offset <= MAX_TARGET_LAG_SECONDS,
         "resolved_at": utc_now(),
     }
     document.reference.update(result)
@@ -285,9 +366,17 @@ def create_next_prediction(total=None):
     total = get_round_count() if total is None else total
     if total < MIN_HISTORY:
         return None
-    _, current = pending_prediction()
+    current_document, current = pending_prediction()
     if current:
-        return current
+        target = parse_time(current.get("predicted_for"))
+        if target is None or datetime.now(timezone.utc) <= target + timedelta(seconds=MAX_TARGET_LAG_SECONDS):
+            return current
+        current_document.reference.update({
+            "resolved": True,
+            "expired": True,
+            "timing_valid": False,
+            "resolved_at": utc_now(),
+        })
     prediction = make_prediction(get_history())
     if prediction is None:
         return None
@@ -304,10 +393,17 @@ def save_state(**values):
 
 
 def collect():
+    with COLLECT_LOCK:
+        return collect_locked()
+
+
+def collect_locked():
     try:
-        source_status, raw_data = fetch_jonbet()
+        latest = get_latest_round()
+        last_round_id = str(latest.get("id")) if latest and latest.get("id") is not None else None
+        source_status, raw_data, pages_fetched, reached_last_known = fetch_jonbet_history(last_round_id)
         incoming = sorted(
-            extract_rounds(raw_data), key=lambda item: item.get("created_at") or ""
+            raw_data, key=lambda item: item.get("created_at") or ""
         )
         new_rounds = []
         for item in incoming:
@@ -319,16 +415,29 @@ def collect():
                 reference.set(normalized)
                 new_rounds.append(normalized)
 
-        resolved = resolve_pending_prediction(new_rounds)
+        resolved = None
+        prediction = None
+        prediction_error = None
+        try:
+            resolved = resolve_pending_prediction(new_rounds)
+        except Exception as error:
+            prediction_error = f"resolve: {error}"
+            logger.exception("Resultados salvos, mas houve falha ao conferir a previsão")
         total = get_round_count()
-        prediction = create_next_prediction(total) if total >= MIN_HISTORY else None
+        try:
+            prediction = create_next_prediction(total) if total >= MIN_HISTORY else None
+        except Exception as error:
+            prediction_error = f"create: {error}"
+            logger.exception("Resultados salvos, mas houve falha ao criar a próxima previsão")
         save_state(
-            status="ok",
-            last_error=None,
+            status="ok" if prediction_error is None else "degraded",
+            last_error=prediction_error,
             last_collection=utc_now(),
             total_rounds=total,
             last_new_rounds=len(new_rounds),
             source_status=source_status,
+            pages_fetched=pages_fetched,
+            backfill_complete=reached_last_known,
         )
         return {
             "success": True,
@@ -336,6 +445,9 @@ def collect():
             "received": len(incoming),
             "new_rounds": len(new_rounds),
             "total_rounds": total,
+            "pages_fetched": pages_fetched,
+            "backfill_complete": reached_last_known,
+            "prediction_error": prediction_error,
             "prediction_enabled": total >= MIN_HISTORY,
             "resolved_prediction": resolved,
             "prediction": prediction,
@@ -347,6 +459,35 @@ def collect():
         except Exception:
             logger.exception("Falha ao salvar o estado de erro")
         raise
+
+
+def collector_worker():
+    logger.info("Coletor permanente iniciado; intervalo=%ss", COLLECT_INTERVAL_SECONDS)
+    while True:
+        started_at = time.monotonic()
+        try:
+            result = collect()
+            logger.info(
+                "Coleta automática concluída: novos=%s total=%s",
+                result.get("new_rounds"),
+                result.get("total_rounds"),
+            )
+        except Exception:
+            logger.exception("Falha no ciclo do coletor permanente")
+        elapsed = time.monotonic() - started_at
+        time.sleep(max(0.5, COLLECT_INTERVAL_SECONDS - elapsed))
+
+
+def start_background_collector():
+    global COLLECTOR_STARTED
+    if not BACKGROUND_COLLECTOR or COLLECTOR_STARTED:
+        return
+    COLLECTOR_STARTED = True
+    threading.Thread(
+        target=collector_worker,
+        name="permanent-collector-v2",
+        daemon=True,
+    ).start()
 
 
 def prediction_stats():
@@ -638,7 +779,16 @@ main{{max-width:760px;margin:auto;padding:26px 18px 50px}} h1{{font-size:2.2rem;
 
 @app.route("/api/health")
 def health():
-    return jsonify(status="online", service="monitor-resultados-v2", time=utc_now())
+    try:
+        freshness = freshness_snapshot()
+        return jsonify(
+            status="online" if freshness["fresh"] else "degraded",
+            service="monitor-resultados-v2",
+            time=utc_now(),
+            freshness=freshness,
+        )
+    except Exception as error:
+        return jsonify(status="degraded", service="monitor-resultados-v2", time=utc_now(), error=str(error)), 503
 
 
 @app.route("/api/rounds")
@@ -729,6 +879,9 @@ def api_prediction_history():
     except Exception as error:
         logger.exception("Falha na exportação do histórico de previsões")
         return jsonify(success=False, error=str(error)), 500
+
+
+start_background_collector()
 
 
 if __name__ == "__main__":
