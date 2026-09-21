@@ -31,6 +31,7 @@ STATE = "v2_system_state"
 
 db = firestore.Client()
 BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
+PREDICTION_INTERVAL_SECONDS = 60
 STATS_CACHE_LOCK = threading.Lock()
 STATS_CACHE = None
 STATS_CACHE_AT = 0.0
@@ -45,9 +46,21 @@ def parse_time(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except (TypeError, ValueError):
         return None
+
+
+def prediction_timing_valid(item):
+    created = parse_time(item.get("created_at"))
+    actual = parse_time(item.get("actual_created_at"))
+    target = parse_time(item.get("predicted_for"))
+    if created is None or actual is None or actual <= created:
+        return False
+    return target is None or actual >= target - timedelta(seconds=5)
 
 
 def brazil_time(value):
@@ -62,18 +75,9 @@ def brazil_time(value):
 def estimate_next_time(history):
     times = [parse_time(item.get("created_at")) for item in history[-30:]]
     times = [value for value in times if value is not None]
-    intervals = []
-    for previous, current in zip(times, times[1:]):
-        seconds = (current - previous).total_seconds()
-        if 1 <= seconds <= 600:
-            intervals.append(seconds)
-    interval = median(intervals[-15:]) if intervals else 60
     latest = times[-1] if times else datetime.now(timezone.utc)
-    if latest.tzinfo is None:
-        latest = latest.replace(tzinfo=timezone.utc)
-    expected = latest + timedelta(seconds=interval)
-    return expected.isoformat(), round(interval, 2)
-
+    expected = latest + timedelta(seconds=PREDICTION_INTERVAL_SECONDS)
+    return expected.isoformat(), PREDICTION_INTERVAL_SECONDS
 
 def fetch_jonbet():
     request = urllib.request.Request(
@@ -231,7 +235,34 @@ def resolve_pending_prediction(new_rounds):
     document, prediction = pending_prediction()
     if document is None:
         return None
-    actual = sorted(new_rounds, key=lambda item: item.get("created_at") or "")[0]
+
+    prediction_created = parse_time(prediction.get("created_at"))
+    predicted_for = parse_time(prediction.get("predicted_for"))
+    candidates = []
+    for candidate in new_rounds:
+        actual_time = parse_time(candidate.get("created_at"))
+        if actual_time is None:
+            continue
+        # Nunca use uma rodada que já existia quando a previsão foi registrada.
+        if prediction_created is not None and actual_time <= prediction_created:
+            continue
+        # Aceita pequena tolerância do relógio da fonte, mas mantém o alvo de 1 minuto.
+        if predicted_for is not None and actual_time < predicted_for - timedelta(seconds=5):
+            continue
+        candidates.append((actual_time, candidate))
+
+    if not candidates:
+        return None
+
+    actual_time, actual = min(candidates, key=lambda pair: pair[0])
+    lead_time = (
+        round((actual_time - prediction_created).total_seconds(), 3)
+        if prediction_created is not None else None
+    )
+    target_offset = (
+        round((actual_time - predicted_for).total_seconds(), 3)
+        if predicted_for is not None else None
+    )
     result = {
         "resolved": True,
         "actual_round_id": actual.get("id"),
@@ -242,11 +273,13 @@ def resolve_pending_prediction(new_rounds):
         "color_correct": prediction.get("predicted_color") == actual.get("color"),
         "actual_created_at": actual.get("created_at"),
         "actual_created_at_display": brazil_time(actual.get("created_at")),
+        "lead_time_seconds": lead_time,
+        "target_offset_seconds": target_offset,
+        "timing_valid": True,
         "resolved_at": utc_now(),
     }
     document.reference.update(result)
     return result
-
 
 def create_next_prediction(total=None):
     total = get_round_count() if total is None else total
@@ -318,8 +351,11 @@ def collect():
 
 def prediction_stats():
     resolved = [
-        document.to_dict()
-        for document in db.collection(PREDICTIONS).where("resolved", "==", True).get()
+        item for item in (
+            document.to_dict()
+            for document in db.collection(PREDICTIONS).where("resolved", "==", True).get()
+        )
+        if prediction_timing_valid(item)
     ]
     total = len(resolved)
     roll_hits = sum(item.get("roll_correct") is True for item in resolved)
@@ -338,8 +374,11 @@ def prediction_stats():
 def calibration_analysis():
     """Group every resolved prediction by the percentage shown to the user."""
     resolved = [
-        document.to_dict()
-        for document in db.collection(PREDICTIONS).where("resolved", "==", True).get()
+        item for item in (
+            document.to_dict()
+            for document in db.collection(PREDICTIONS).where("resolved", "==", True).get()
+        )
+        if prediction_timing_valid(item)
     ]
 
     def percentage(value):
@@ -416,7 +455,8 @@ def prediction_history_export():
         "predicted_color", "predicted_color_name", "color_confidence", "color_method",
         "predicted_roll", "roll_confidence", "roll_method", "resolved",
         "actual_round_id", "actual_created_at", "actual_color", "actual_color_name",
-        "actual_roll", "color_correct", "roll_correct", "resolved_at",
+        "actual_roll", "color_correct", "roll_correct", "timing_valid",
+        "lead_time_seconds", "target_offset_seconds", "resolved_at",
     )
     rows = []
     for document in db.collection(PREDICTIONS).where("resolved", "==", True).get():
