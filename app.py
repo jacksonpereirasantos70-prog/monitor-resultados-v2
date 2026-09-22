@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from statistics import median
 from zoneinfo import ZoneInfo
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from google.cloud import firestore
 
 
@@ -700,6 +700,26 @@ def timing_analysis(limit=HISTORY_LIMIT):
         "numbers_by_second": by_second,
         "note": "Horário e frequência descrevem o histórico; não garantem o próximo resultado.",
     }
+
+
+@app.after_request
+def allow_public_analysis_cors(response):
+    """Allow the Double laboratory to read public, read-only analysis endpoints."""
+    public_paths = (
+        "/api/health",
+        "/api/rounds",
+        "/api/stats",
+        "/api/analysis/predictions",
+        "/api/analysis/calibration",
+        "/api/analysis/timing",
+        "/api/calculator",
+    )
+    if request.path in public_paths:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/")
