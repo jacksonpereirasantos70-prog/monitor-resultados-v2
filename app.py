@@ -97,7 +97,14 @@ def estimate_next_time(history):
     ]
     interval = median(intervals[-40:]) if intervals else DEFAULT_ROUND_INTERVAL_SECONDS
     interval = round(min(35.0, max(25.0, interval)), 3)
+    minimum_target = datetime.now(timezone.utc) + timedelta(
+        seconds=MIN_PREDICTION_LEAD_SECONDS
+    )
+    rounds_ahead = 1
     expected = latest + timedelta(seconds=interval)
+    while expected <= minimum_target:
+        rounds_ahead += 1
+        expected = latest + timedelta(seconds=interval * rounds_ahead)
     return expected.isoformat(), interval
 
 def jonbet_page_url(page):
@@ -289,6 +296,13 @@ def make_prediction(history):
 
     predicted_for, estimated_interval = estimate_next_time(history)
     latest_round = history[-1]
+    latest_time = parse_time(latest_round.get("created_at"))
+    predicted_time = parse_time(predicted_for)
+    prediction_horizon_rounds = (
+        max(1, round((predicted_time - latest_time).total_seconds() / estimated_interval))
+        if latest_time is not None and predicted_time is not None and estimated_interval > 0
+        else 1
+    )
 
     return {
         "predicted_roll": predicted_roll,
@@ -307,6 +321,7 @@ def make_prediction(history):
         "predicted_for": predicted_for,
         "predicted_for_display": brazil_time(predicted_for),
         "estimated_interval_seconds": estimated_interval,
+        "prediction_horizon_rounds": prediction_horizon_rounds,
         "created_at": utc_now(),
         "resolved": False,
     }
@@ -335,7 +350,7 @@ def resolve_pending_prediction(available_rounds):
         # fonte pode divulgar o resultado depois do horário gravado na rodada.
         if based_on_time is not None and actual_time <= based_on_time:
             continue
-        if based_on_time is None and predicted_for is not None:
+        if predicted_for is not None:
             if actual_time < predicted_for - timedelta(seconds=5):
                 continue
             if actual_time > predicted_for + timedelta(seconds=MAX_TARGET_LAG_SECONDS):
@@ -348,7 +363,13 @@ def resolve_pending_prediction(available_rounds):
     if not candidates:
         return None
 
-    actual_time, actual = min(candidates, key=lambda pair: pair[0])
+    actual_time, actual = min(
+        candidates,
+        key=lambda pair: (
+            abs((pair[0] - predicted_for).total_seconds())
+            if predicted_for is not None else pair[0].timestamp()
+        ),
+    )
     lead_time = (
         round((actual_time - prediction_created).total_seconds(), 3)
         if prediction_created is not None else None
@@ -400,6 +421,18 @@ def create_next_prediction(total=None):
     total = get_round_count() if total is None else total
     if total < MIN_HISTORY:
         return None
+    _, current = pending_prediction()
+    if current:
+        current_target = parse_time(current.get("predicted_for"))
+        current_created = parse_time(current.get("created_at"))
+        if (
+            current_target is not None
+            and current_created is not None
+            and current_created < current_target
+            and current_target
+            > datetime.now(timezone.utc) + timedelta(seconds=MIN_PREDICTION_LEAD_SECONDS)
+        ):
+            return current
     prediction = make_prediction(get_history())
     if prediction is None:
         return None
@@ -645,6 +678,7 @@ def calibration_analysis():
 def prediction_history_export(include_invalid=False):
     fields = (
         "prediction_id", "created_at", "predicted_for", "history_size",
+        "prediction_horizon_rounds",
         "based_on_round_id", "based_on_round_created_at",
         "predicted_color", "predicted_color_name", "color_confidence", "color_method",
         "predicted_roll", "roll_confidence", "roll_method", "resolved",
