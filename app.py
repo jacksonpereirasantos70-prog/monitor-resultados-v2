@@ -327,11 +327,8 @@ def make_prediction(history):
     }
 
 
-def resolve_pending_prediction(available_rounds):
+def _resolve_prediction(document, prediction, available_rounds):
     if not available_rounds:
-        return None
-    document, prediction = pending_prediction()
-    if document is None:
         return None
 
     prediction_created = parse_time(prediction.get("created_at"))
@@ -416,6 +413,23 @@ def resolve_pending_prediction(available_rounds):
     }
     document.reference.update(result)
     return result
+
+
+def resolve_pending_prediction(available_rounds):
+    if not available_rounds:
+        return None
+    documents = db.collection(PREDICTIONS).where("resolved", "==", False).get()
+    resolved = []
+    for document in sorted(
+        documents,
+        key=lambda item: item.to_dict().get("predicted_for") or "",
+    ):
+        prediction = document.to_dict()
+        result = _resolve_prediction(document, prediction, available_rounds)
+        if result:
+            result["prediction_id"] = document.id
+            resolved.append(result)
+    return resolved[-1] if resolved else None
 
 def create_next_prediction(total=None):
     total = get_round_count() if total is None else total
