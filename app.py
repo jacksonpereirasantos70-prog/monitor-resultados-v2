@@ -400,11 +400,6 @@ def create_next_prediction(total=None):
     total = get_round_count() if total is None else total
     if total < MIN_HISTORY:
         return None
-    _, current = pending_prediction()
-    if current:
-        # A fonte pode publicar a rodada depois do horário registrado. Aguarde
-        # a rodada real em vez de encerrar a previsão apenas pelo relógio.
-        return current
     prediction = make_prediction(get_history())
     if prediction is None:
         return None
@@ -420,6 +415,11 @@ def create_next_prediction(total=None):
     if not based_on_round_id:
         return None
     reference = db.collection(PREDICTIONS).document(f"after_{based_on_round_id}")
+    existing = reference.get()
+    if existing.exists:
+        data = existing.to_dict()
+        data["prediction_id"] = existing.id
+        return None if data.get("resolved") else data
     prediction["prediction_id"] = reference.id
     prediction["history_size"] = total
     try:
@@ -432,7 +432,7 @@ def create_next_prediction(total=None):
             return None
         data = existing.to_dict()
         data["prediction_id"] = existing.id
-        return data
+        return None if data.get("resolved") else data
 
 
 def save_state(**values):
