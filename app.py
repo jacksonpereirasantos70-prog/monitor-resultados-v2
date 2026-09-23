@@ -447,7 +447,10 @@ def create_next_prediction(total=None):
     based_on_round_id = str(prediction.get("based_on_round_id") or "")
     if not based_on_round_id:
         return None
-    reference = db.collection(PREDICTIONS).document(f"after_{based_on_round_id}")
+    target_key = int(predicted_for.timestamp() * 1000)
+    reference = db.collection(PREDICTIONS).document(
+        f"target_{target_key}_{based_on_round_id}"
+    )
     existing = reference.get()
     if existing.exists:
         data = existing.to_dict()
@@ -459,7 +462,8 @@ def create_next_prediction(total=None):
         reference.create(prediction)
         return prediction
     except AlreadyExists:
-        # O ID determinístico bloqueia duplicatas criadas por várias instâncias.
+        # Horário-alvo + rodada-base bloqueiam duplicatas entre instâncias sem
+        # colidir com uma previsão antiga da mesma rodada-base.
         existing = reference.get()
         if not existing.exists:
             return None
