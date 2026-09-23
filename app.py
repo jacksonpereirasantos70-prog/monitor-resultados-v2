@@ -10,6 +10,7 @@ from statistics import median
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
 
 
@@ -36,6 +37,9 @@ DEFAULT_ROUND_INTERVAL_SECONDS = float(os.getenv("ROUND_INTERVAL_SECONDS", "30.0
 MAX_BACKFILL_PAGES = max(1, min(50, int(os.getenv("MAX_BACKFILL_PAGES", "20"))))
 STALE_AFTER_SECONDS = max(45.0, float(os.getenv("STALE_AFTER_SECONDS", "75")))
 MAX_TARGET_LAG_SECONDS = max(5.0, float(os.getenv("MAX_TARGET_LAG_SECONDS", "15")))
+MIN_PREDICTION_LEAD_SECONDS = max(
+    1.0, float(os.getenv("MIN_PREDICTION_LEAD_SECONDS", "2"))
+)
 BACKGROUND_COLLECTOR = os.getenv("BACKGROUND_COLLECTOR", "true").lower() in ("1", "true", "yes", "on")
 COLLECT_LOCK = threading.Lock()
 COLLECTOR_STARTED = False
@@ -308,8 +312,8 @@ def make_prediction(history):
     }
 
 
-def resolve_pending_prediction(new_rounds):
-    if not new_rounds:
+def resolve_pending_prediction(available_rounds):
+    if not available_rounds:
         return None
     document, prediction = pending_prediction()
     if document is None:
@@ -317,19 +321,28 @@ def resolve_pending_prediction(new_rounds):
 
     prediction_created = parse_time(prediction.get("created_at"))
     predicted_for = parse_time(prediction.get("predicted_for"))
+    based_on_time = parse_time(prediction.get("based_on_round_created_at"))
+    based_on_round_id = str(prediction.get("based_on_round_id") or "")
     candidates = []
-    for candidate in new_rounds:
+    for candidate in available_rounds:
         actual_time = parse_time(candidate.get("created_at"))
         if actual_time is None:
             continue
-        # Nunca use uma rodada que já existia quando a previsão foi registrada.
-        if prediction_created is not None and actual_time <= prediction_created:
+        candidate_id = str(candidate.get("id") or "")
+        if based_on_round_id and candidate_id == based_on_round_id:
             continue
-        # Aceita pequena tolerância do relógio da fonte, mas mantém o alvo de 1 minuto.
-        if predicted_for is not None and actual_time < predicted_for - timedelta(seconds=5):
+        # A previsão pertence à primeira rodada posterior à rodada-base. A
+        # fonte pode divulgar o resultado depois do horário gravado na rodada.
+        if based_on_time is not None and actual_time <= based_on_time:
             continue
-        if predicted_for is not None and actual_time > predicted_for + timedelta(seconds=MAX_TARGET_LAG_SECONDS):
-            continue
+        if based_on_time is None and predicted_for is not None:
+            if actual_time < predicted_for - timedelta(seconds=5):
+                continue
+            if actual_time > predicted_for + timedelta(seconds=MAX_TARGET_LAG_SECONDS):
+                continue
+        if based_on_time is None and predicted_for is None:
+            if prediction_created is not None and actual_time <= prediction_created:
+                continue
         candidates.append((actual_time, candidate))
 
     if not candidates:
@@ -344,19 +357,40 @@ def resolve_pending_prediction(new_rounds):
         round((actual_time - predicted_for).total_seconds(), 3)
         if predicted_for is not None else None
     )
+    created_before_result = (
+        prediction_created is not None and actual_time > prediction_created
+    )
+    target_in_window = (
+        target_offset is None
+        or -5 <= target_offset <= MAX_TARGET_LAG_SECONDS
+    )
+    timing_valid = created_before_result and target_in_window
+    invalid_reason = None
+    if not created_before_result:
+        invalid_reason = "prediction_created_after_actual"
+    elif not target_in_window:
+        invalid_reason = "target_window_missed"
     result = {
         "resolved": True,
+        "expired": not timing_valid,
+        "invalid_reason": invalid_reason,
         "actual_round_id": actual.get("id"),
         "actual_roll": actual.get("roll"),
         "actual_color": actual.get("color"),
         "actual_color_name": color_name(actual.get("color")),
-        "roll_correct": prediction.get("predicted_roll") == actual.get("roll"),
-        "color_correct": prediction.get("predicted_color") == actual.get("color"),
+        "roll_correct": (
+            prediction.get("predicted_roll") == actual.get("roll")
+            if timing_valid else None
+        ),
+        "color_correct": (
+            prediction.get("predicted_color") == actual.get("color")
+            if timing_valid else None
+        ),
         "actual_created_at": actual.get("created_at"),
         "actual_created_at_display": brazil_time(actual.get("created_at")),
         "lead_time_seconds": lead_time,
         "target_offset_seconds": target_offset,
-        "timing_valid": target_offset is None or -5 <= target_offset <= MAX_TARGET_LAG_SECONDS,
+        "timing_valid": timing_valid,
         "resolved_at": utc_now(),
     }
     document.reference.update(result)
@@ -366,25 +400,39 @@ def create_next_prediction(total=None):
     total = get_round_count() if total is None else total
     if total < MIN_HISTORY:
         return None
-    current_document, current = pending_prediction()
+    _, current = pending_prediction()
     if current:
-        target = parse_time(current.get("predicted_for"))
-        if target is None or datetime.now(timezone.utc) <= target + timedelta(seconds=MAX_TARGET_LAG_SECONDS):
-            return current
-        current_document.reference.update({
-            "resolved": True,
-            "expired": True,
-            "timing_valid": False,
-            "resolved_at": utc_now(),
-        })
+        # A fonte pode publicar a rodada depois do horário registrado. Aguarde
+        # a rodada real em vez de encerrar a previsão apenas pelo relógio.
+        return current
     prediction = make_prediction(get_history())
     if prediction is None:
         return None
-    reference = db.collection(PREDICTIONS).document()
+    predicted_for = parse_time(prediction.get("predicted_for"))
+    if (
+        predicted_for is None
+        or predicted_for
+        <= datetime.now(timezone.utc) + timedelta(seconds=MIN_PREDICTION_LEAD_SECONDS)
+    ):
+        # Nunca crie uma previsão para uma rodada já ocorrida ou sem tempo útil.
+        return None
+    based_on_round_id = str(prediction.get("based_on_round_id") or "")
+    if not based_on_round_id:
+        return None
+    reference = db.collection(PREDICTIONS).document(f"after_{based_on_round_id}")
     prediction["prediction_id"] = reference.id
     prediction["history_size"] = total
-    reference.set(prediction)
-    return prediction
+    try:
+        reference.create(prediction)
+        return prediction
+    except AlreadyExists:
+        # O ID determinístico bloqueia duplicatas criadas por várias instâncias.
+        existing = reference.get()
+        if not existing.exists:
+            return None
+        data = existing.to_dict()
+        data["prediction_id"] = existing.id
+        return data
 
 
 def save_state(**values):
@@ -406,10 +454,12 @@ def collect_locked():
             raw_data, key=lambda item: item.get("created_at") or ""
         )
         new_rounds = []
+        available_rounds = []
         for item in incoming:
             normalized = normalize_round(item)
             if normalized is None:
                 continue
+            available_rounds.append(normalized)
             reference = db.collection(ROUNDS).document(normalized["id"])
             if not reference.get().exists:
                 reference.set(normalized)
@@ -419,7 +469,9 @@ def collect_locked():
         prediction = None
         prediction_error = None
         try:
-            resolved = resolve_pending_prediction(new_rounds)
+            # Normal e V2 podem salvar a mesma rodada antes um do outro. Mesmo
+            # já armazenada, a rodada retornada pela fonte resolve a previsão.
+            resolved = resolve_pending_prediction(available_rounds)
         except Exception as error:
             prediction_error = f"resolve: {error}"
             logger.exception("Resultados salvos, mas houve falha ao conferir a previsão")
@@ -590,11 +642,13 @@ def calibration_analysis():
     }
 
 
-def prediction_history_export():
+def prediction_history_export(include_invalid=False):
     fields = (
         "prediction_id", "created_at", "predicted_for", "history_size",
+        "based_on_round_id", "based_on_round_created_at",
         "predicted_color", "predicted_color_name", "color_confidence", "color_method",
         "predicted_roll", "roll_confidence", "roll_method", "resolved",
+        "expired", "invalid_reason",
         "actual_round_id", "actual_created_at", "actual_color", "actual_color_name",
         "actual_roll", "color_correct", "roll_correct", "timing_valid",
         "lead_time_seconds", "target_offset_seconds", "resolved_at",
@@ -602,6 +656,8 @@ def prediction_history_export():
     rows = []
     for document in db.collection(PREDICTIONS).where("resolved", "==", True).get():
         item = document.to_dict()
+        if not include_invalid and not prediction_timing_valid(item):
+            continue
         row = {field: item.get(field) for field in fields}
         row["prediction_id"] = row.get("prediction_id") or document.id
         row["predicted_color_name"] = (
@@ -894,7 +950,16 @@ def api_calibration_analysis():
 @app.route("/api/analysis/predictions")
 def api_prediction_history():
     try:
-        rows = prediction_history_export()
+        include_invalid = request.args.get("include_invalid", "").lower() in (
+            "1", "true", "yes", "on"
+        )
+        rows = prediction_history_export(include_invalid=include_invalid)
+        try:
+            limit = max(0, min(5000, int(request.args.get("limit", "0"))))
+        except ValueError:
+            limit = 0
+        if limit:
+            rows = rows[-limit:]
         return jsonify(success=True, service="monitor-resultados-v2", total=len(rows), predictions=rows)
     except Exception as error:
         logger.exception("Falha na exportação do histórico de previsões")
