@@ -5,6 +5,7 @@ import threading
 import time
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from statistics import median
 from zoneinfo import ZoneInfo
@@ -25,6 +26,9 @@ JONBET_URL = os.getenv(
 )
 MIN_HISTORY = int(os.getenv("MIN_HISTORY", "1000"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "5000"))
+PREDICTION_HISTORY_LIMIT = max(
+    200, min(HISTORY_LIMIT, int(os.getenv("PREDICTION_HISTORY_LIMIT", "1000")))
+)
 
 ROUNDS = "v2_rounds"
 PREDICTIONS = "v2_predictions"
@@ -46,7 +50,13 @@ COLLECTOR_STARTED = False
 STATS_CACHE_LOCK = threading.Lock()
 STATS_CACHE = None
 STATS_CACHE_AT = 0.0
-STATS_CACHE_SECONDS = max(5, int(os.getenv("STATS_CACHE_SECONDS", "15")))
+STATS_CACHE_SECONDS = max(60, int(os.getenv("STATS_CACHE_SECONDS", "300")))
+STATS_REFRESH_LOCK = threading.Lock()
+STATS_REFRESHING = False
+STATE_CACHE_LOCK = threading.Lock()
+STATE_CACHE = {}
+STATE_CACHE_AT = 0.0
+STATE_CACHE_SECONDS = max(5, int(os.getenv("STATE_CACHE_SECONDS", "30")))
 
 
 def utc_now():
@@ -183,7 +193,7 @@ def normalize_round(item):
 
 
 def color_name(color):
-    return {0: "branco", 1: "verde", 2: "escuro"}.get(color, str(color))
+    return {0: "branco", 1: "verde", 2: "preto"}.get(color, str(color))
 
 
 def get_round_count():
@@ -210,8 +220,14 @@ def get_latest_round():
 
 
 def freshness_snapshot():
-    latest = get_latest_round()
-    actual_time = parse_time(latest.get("created_at")) if latest else None
+    state = state_data()
+    latest = {
+        "id": state.get("last_round_id"),
+        "created_at": state.get("last_round_created_at"),
+    }
+    if not latest["created_at"]:
+        latest = get_latest_round() or {}
+    actual_time = parse_time(latest.get("created_at"))
     age = (
         round((datetime.now(timezone.utc) - actual_time).total_seconds(), 3)
         if actual_time is not None else None
@@ -447,7 +463,7 @@ def create_next_prediction(total=None):
             > datetime.now(timezone.utc) + timedelta(seconds=MIN_PREDICTION_LEAD_SECONDS)
         ):
             return current
-    prediction = make_prediction(get_history())
+    prediction = make_prediction(get_history(limit=PREDICTION_HISTORY_LIMIT))
     if prediction is None:
         return None
     predicted_for = parse_time(prediction.get("predicted_for"))
@@ -487,13 +503,26 @@ def create_next_prediction(total=None):
 
 
 def save_state(**values):
+    global STATE_CACHE, STATE_CACHE_AT
     values["updated_at"] = utc_now()
     db.collection(STATE).document("main").set(values, merge=True)
+    with STATE_CACHE_LOCK:
+        STATE_CACHE = {**STATE_CACHE, **values}
+        STATE_CACHE_AT = time.monotonic()
 
 
-def collect():
-    with COLLECT_LOCK:
+def collect(blocking=True):
+    acquired = COLLECT_LOCK.acquire(blocking=blocking)
+    if not acquired:
+        return {
+            "success": True,
+            "busy": True,
+            "message": "Uma coleta já está em andamento.",
+        }
+    try:
         return collect_locked()
+    finally:
+        COLLECT_LOCK.release()
 
 
 def collect_locked():
@@ -506,15 +535,26 @@ def collect_locked():
         )
         new_rounds = []
         available_rounds = []
+        references = []
         for item in incoming:
             normalized = normalize_round(item)
             if normalized is None:
                 continue
             available_rounds.append(normalized)
-            reference = db.collection(ROUNDS).document(normalized["id"])
-            if not reference.get().exists:
-                reference.set(normalized)
+            references.append(db.collection(ROUNDS).document(normalized["id"]))
+
+        # Uma única leitura e uma única gravação em lote substituem dezenas de
+        # viagens sequenciais ao Firestore a cada rodada.
+        existing_ids = {
+            document.id for document in db.get_all(references) if document.exists
+        } if references else set()
+        batch = db.batch()
+        for normalized, reference in zip(available_rounds, references):
+            if normalized["id"] not in existing_ids:
+                batch.set(reference, normalized)
                 new_rounds.append(normalized)
+        if new_rounds:
+            batch.commit()
 
         resolved = None
         prediction = None
@@ -541,7 +581,12 @@ def collect_locked():
             source_status=source_status,
             pages_fetched=pages_fetched,
             backfill_complete=reached_last_known,
+            last_round_id=(available_rounds[-1].get("id") if available_rounds else last_round_id),
+            last_round_created_at=(available_rounds[-1].get("created_at") if available_rounds else (latest or {}).get("created_at")),
+            current_prediction=prediction,
         )
+        if resolved:
+            schedule_stats_refresh()
         return {
             "success": True,
             "source_status": source_status,
@@ -693,7 +738,7 @@ def calibration_analysis():
     }
 
 
-def prediction_history_export(include_invalid=False):
+def prediction_history_export(include_invalid=False, limit=0):
     fields = (
         "prediction_id", "created_at", "predicted_for", "history_size",
         "prediction_horizon_rounds",
@@ -706,8 +751,23 @@ def prediction_history_export(include_invalid=False):
         "lead_time_seconds", "target_offset_seconds", "resolved_at",
     )
     rows = []
-    for document in db.collection(PREDICTIONS).where("resolved", "==", True).get():
+    if limit:
+        # O painel e o aplicativo normalmente pedem somente as linhas recentes.
+        # Limitar antes da leitura evita baixar milhares de documentos para
+        # depois descartar quase todos eles.
+        scan_limit = min(5000, max(limit + 10, limit * 3))
+        documents = (
+            db.collection(PREDICTIONS)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(scan_limit)
+            .get()
+        )
+    else:
+        documents = db.collection(PREDICTIONS).where("resolved", "==", True).get()
+    for document in documents:
         item = document.to_dict()
+        if item.get("resolved") is not True:
+            continue
         if not include_invalid and not prediction_timing_valid(item):
             continue
         row = {field: item.get(field) for field in fields}
@@ -722,18 +782,71 @@ def prediction_history_export(include_invalid=False):
         )
         rows.append(row)
     rows.sort(key=lambda row: row.get("actual_created_at") or row.get("resolved_at") or "")
-    return rows
+    return rows[-limit:] if limit else rows
+
+
+def empty_prediction_stats():
+    return {
+        "predictions_resolved": 0,
+        "roll_hits": 0,
+        "roll_errors": 0,
+        "roll_accuracy": 0,
+        "color_hits": 0,
+        "color_errors": 0,
+        "color_accuracy": 0,
+    }
+
+
+def _refresh_prediction_stats():
+    global STATS_CACHE, STATS_CACHE_AT, STATS_REFRESHING
+    try:
+        stats = prediction_stats()
+        with STATS_CACHE_LOCK:
+            STATS_CACHE = stats
+            STATS_CACHE_AT = time.monotonic()
+        save_state(performance_cache=stats, performance_cache_at=utc_now())
+    except Exception:
+        logger.exception("Falha ao atualizar estatísticas em segundo plano")
+    finally:
+        with STATS_REFRESH_LOCK:
+            STATS_REFRESHING = False
+
+
+def schedule_stats_refresh():
+    global STATS_REFRESHING
+    with STATS_REFRESH_LOCK:
+        if STATS_REFRESHING:
+            return False
+        STATS_REFRESHING = True
+    threading.Thread(
+        target=_refresh_prediction_stats,
+        name="prediction-stats-refresh-v2",
+        daemon=True,
+    ).start()
+    return True
 
 
 def cached_prediction_stats(force=False):
     global STATS_CACHE, STATS_CACHE_AT
     now = time.monotonic()
     with STATS_CACHE_LOCK:
-        if not force and STATS_CACHE is not None and now - STATS_CACHE_AT < STATS_CACHE_SECONDS:
-            return dict(STATS_CACHE)
-        STATS_CACHE = prediction_stats()
-        STATS_CACHE_AT = now
-        return dict(STATS_CACHE)
+        cached = dict(STATS_CACHE) if STATS_CACHE is not None else None
+        fresh = cached is not None and now - STATS_CACHE_AT < STATS_CACHE_SECONDS
+    if fresh and not force:
+        return cached
+    if force:
+        _refresh_prediction_stats()
+        with STATS_CACHE_LOCK:
+            return dict(STATS_CACHE or empty_prediction_stats())
+
+    persisted = state_data().get("performance_cache")
+    if cached is None and isinstance(persisted, dict):
+        cached = {**empty_prediction_stats(), **persisted}
+        with STATS_CACHE_LOCK:
+            STATS_CACHE = cached
+            STATS_CACHE_AT = now
+    schedule_stats_refresh()
+    return cached or empty_prediction_stats()
 
 
 def recent_predictions(limit=10):
@@ -743,12 +856,27 @@ def recent_predictions(limit=10):
         .limit(limit)
         .get()
     )
-    return [document.to_dict() for document in documents]
+    rows = [document.to_dict() for document in documents]
+    for row in rows:
+        if row.get("predicted_color_name") == "escuro":
+            row["predicted_color_name"] = "preto"
+        if row.get("actual_color_name") == "escuro":
+            row["actual_color_name"] = "preto"
+    return rows
 
 
-def state_data():
+def state_data(force=False):
+    global STATE_CACHE, STATE_CACHE_AT
+    now = time.monotonic()
+    with STATE_CACHE_LOCK:
+        if not force and STATE_CACHE and now - STATE_CACHE_AT < STATE_CACHE_SECONDS:
+            return dict(STATE_CACHE)
     document = db.collection(STATE).document("main").get()
-    return document.to_dict() if document.exists else {}
+    data = document.to_dict() if document.exists else {}
+    with STATE_CACHE_LOCK:
+        STATE_CACHE = data
+        STATE_CACHE_AT = now
+    return dict(data)
 
 
 def timing_analysis(limit=HISTORY_LIMIT):
@@ -833,11 +961,25 @@ def allow_public_analysis_cors(response):
 @app.route("/")
 def home():
     try:
-        total = get_round_count()
-        stats = prediction_stats()
-        recent = recent_predictions()
-        _, current = pending_prediction()
-        state = state_data()
+        # O painel nunca deve aguardar uma análise histórica completa.
+        executor = ThreadPoolExecutor(max_workers=4)
+        jobs = {
+            "stats": executor.submit(cached_prediction_stats),
+            "recent": executor.submit(recent_predictions),
+            "current": executor.submit(pending_prediction),
+            "state": executor.submit(state_data),
+        }
+        completed, pending = wait(jobs.values(), timeout=4)
+        for job in pending:
+            job.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        state = jobs["state"].result() if jobs["state"] in completed else {}
+        total = int(state.get("total_rounds", 0))
+        stats = jobs["stats"].result() if jobs["stats"] in completed else empty_prediction_stats()
+        recent = jobs["recent"].result() if jobs["recent"] in completed else []
+        _, current = jobs["current"].result() if jobs["current"] in completed else (None, state.get("current_prediction"))
+        if current and current.get("predicted_color_name") == "escuro":
+            current = {**current, "predicted_color_name": "preto"}
         progress = min(100, round(total / MIN_HISTORY * 100, 1))
         if total < MIN_HISTORY:
             estimate = (
@@ -846,10 +988,10 @@ def home():
             )
         elif current:
             estimate = f"""
-            <p class="target">Previsão para <strong>{current.get('predicted_for_display', brazil_time(current.get('predicted_for')))}</strong></p>
+            <p class="target">Previsão para <strong id="target-time">{current.get('predicted_for_display', brazil_time(current.get('predicted_for')))}</strong></p>
             <div class="prediction-grid">
-              <div><span>Próxima cor estimada</span><strong>{current.get('predicted_color_name')}</strong><small>{current.get('color_confidence')}% de frequência na amostra</small></div>
-              <div><span>Próximo número estimado</span><strong>{current.get('predicted_roll')}</strong><small>{current.get('roll_confidence')}% de frequência na amostra</small></div>
+              <div><span>Próxima cor estimada</span><strong id="predicted-color">{current.get('predicted_color_name')}</strong><small id="color-confidence">{current.get('color_confidence')}% de frequência na amostra</small></div>
+              <div><span>Próximo número estimado</span><strong id="predicted-roll">{current.get('predicted_roll')}</strong><small id="roll-confidence">{current.get('roll_confidence')}% de frequência na amostra</small></div>
             </div>
             <p class="muted">Métodos: cor — {current.get('color_method')}; número — {current.get('roll_method')}.</p>
             """
@@ -900,6 +1042,39 @@ main{{max-width:760px;margin:auto;padding:26px 18px 50px}} h1{{font-size:2.2rem;
 <section class="card"><h2>Desempenho real</h2><p>Previsões conferidas: <strong>{stats['predictions_resolved']}</strong></p><div class="stats"><div>Cor<br><strong>{stats['color_accuracy']}%</strong><br>{stats['color_hits']} acertos / {stats['color_errors']} erros</div><div>Número<br><strong>{stats['roll_accuracy']}%</strong><br>{stats['roll_hits']} acertos / {stats['roll_errors']} erros</div></div></section>
 <section class="card"><h2>Histórico das previsões</h2>{history_html}</section>
 <section class="card"><h2>Ferramentas</h2><a href="/api/collect">Executar coleta agora</a><a href="/api/stats">Estatísticas em JSON</a><a href="/api/state">Estado do coletor</a><a href="/api/verify">Verificar sistema</a><a href="/api/rounds">Resultados atuais da fonte</a></section>
+<script>
+let syncing = false;
+async function syncRound() {{
+  if (syncing) return;
+  syncing = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4500);
+  try {{
+    const response = await fetch('/api/stats', {{cache:'no-store', signal:controller.signal}});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const prediction = (await response.json()).current_prediction;
+    if (!prediction) return;
+    const color = document.getElementById('predicted-color');
+    if (!color) {{ location.reload(); return; }}
+    document.getElementById('target-time').textContent = prediction.predicted_for_display || '';
+    color.textContent = prediction.predicted_color_name ?? '-';
+    document.getElementById('predicted-roll').textContent = prediction.predicted_roll ?? '-';
+    document.getElementById('color-confidence').textContent = (prediction.color_confidence ?? 0) + '% de frequência na amostra';
+    document.getElementById('roll-confidence').textContent = (prediction.roll_confidence ?? 0) + '% de frequência na amostra';
+  }} catch (error) {{
+    console.debug('Sincronização temporariamente indisponível', error);
+  }} finally {{
+    clearTimeout(timeout);
+    syncing = false;
+  }}
+}}
+syncRound();
+setInterval(syncRound, 8000);
+document.addEventListener('visibilitychange', () => {{
+  if (document.visibilityState === 'visible') syncRound();
+}});
+window.addEventListener('online', syncRound);
+</script>
 </main></body></html>"""
     except Exception as error:
         return jsonify(success=False, error=str(error)), 500
@@ -931,7 +1106,7 @@ def rounds():
 @app.route("/api/collect")
 def api_collect():
     try:
-        return jsonify(collect())
+        return jsonify(collect(blocking=False))
     except Exception as error:
         return jsonify(success=False, error=str(error)), 500
 
@@ -939,8 +1114,13 @@ def api_collect():
 @app.route("/api/stats")
 def api_stats():
     try:
-        total = get_round_count()
-        _, current = pending_prediction()
+        state = state_data()
+        total = int(state.get("total_rounds", 0))
+        current = state.get("current_prediction")
+        if not current:
+            _, current = pending_prediction()
+        if current and current.get("predicted_color_name") == "escuro":
+            current = {**current, "predicted_color_name": "preto"}
         return jsonify(
             success=True,
             total_rounds=total,
@@ -1005,13 +1185,14 @@ def api_prediction_history():
         include_invalid = request.args.get("include_invalid", "").lower() in (
             "1", "true", "yes", "on"
         )
-        rows = prediction_history_export(include_invalid=include_invalid)
         try:
             limit = max(0, min(5000, int(request.args.get("limit", "0"))))
         except ValueError:
             limit = 0
-        if limit:
-            rows = rows[-limit:]
+        rows = prediction_history_export(
+            include_invalid=include_invalid,
+            limit=limit,
+        )
         return jsonify(success=True, service="monitor-resultados-v2", total=len(rows), predictions=rows)
     except Exception as error:
         logger.exception("Falha na exportação do histórico de previsões")
