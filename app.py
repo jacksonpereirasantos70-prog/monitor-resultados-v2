@@ -18,7 +18,7 @@ from google.cloud import firestore
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("monitor-resultados-v2")
-APP_VERSION = "2026.09.24.4"
+APP_VERSION = "2026.09.24.5"
 
 JONBET_URL = os.getenv(
     "JONBET_URL",
@@ -88,6 +88,29 @@ def prediction_timing_valid(item):
         return True
     offset = (actual - target).total_seconds()
     return -5 <= offset <= MAX_TARGET_LAG_SECONDS
+
+
+def deduplicate_resolved_predictions(items):
+    """Keep one deterministic prediction for each real Jonbet round."""
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            item.get("actual_created_at") or item.get("resolved_at") or "",
+            item.get("created_at") or "",
+            item.get("prediction_id") or "",
+        ),
+    )
+    unique = []
+    seen = set()
+    for item in ordered:
+        key = item.get("actual_round_id")
+        if not key:
+            key = ("prediction", item.get("prediction_id"), item.get("created_at"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def brazil_time(value):
@@ -488,10 +511,11 @@ def create_next_prediction(total=None):
     based_on_round_id = str(prediction.get("based_on_round_id") or "")
     if not based_on_round_id:
         return None
-    target_key = int(predicted_for.timestamp() * 1000)
-    reference = db.collection(PREDICTIONS).document(
-        f"target_{target_key}_{based_on_round_id}"
-    )
+    # Todas as instâncias usam o mesmo documento para o mesmo ciclo de 30 s.
+    # Isso bloqueia previsões duplicadas mesmo que os relógios estimados
+    # difiram por alguns milissegundos ou a rodada-base ainda esteja atrasada.
+    target_slot = int(round(predicted_for.timestamp() / 30.0))
+    reference = db.collection(PREDICTIONS).document(f"target_slot_{target_slot}")
     existing = reference.get()
     if existing.exists:
         data = existing.to_dict()
@@ -657,6 +681,7 @@ def prediction_stats():
         )
         if prediction_timing_valid(item)
     ]
+    resolved = deduplicate_resolved_predictions(resolved)
     total = len(resolved)
     roll_hits = sum(item.get("roll_correct") is True for item in resolved)
     color_hits = sum(item.get("color_correct") is True for item in resolved)
@@ -680,6 +705,7 @@ def calibration_analysis():
         )
         if prediction_timing_valid(item)
     ]
+    resolved = deduplicate_resolved_predictions(resolved)
 
     def percentage(value):
         try:
@@ -793,6 +819,7 @@ def prediction_history_export(include_invalid=False, limit=0):
         )
         rows.append(row)
     rows.sort(key=lambda row: row.get("actual_created_at") or row.get("resolved_at") or "")
+    rows = deduplicate_resolved_predictions(rows)
     return rows[-limit:] if limit else rows
 
 
