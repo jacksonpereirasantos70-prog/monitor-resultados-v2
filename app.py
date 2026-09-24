@@ -220,13 +220,9 @@ def get_latest_round():
 
 
 def freshness_snapshot():
-    state = state_data()
-    latest = {
-        "id": state.get("last_round_id"),
-        "created_at": state.get("last_round_created_at"),
-    }
-    if not latest["created_at"]:
-        latest = get_latest_round() or {}
+    # O documento de estado pode ser gravado fora de ordem quando o Cloud Run
+    # usa mais de uma instância. A coleção de rodadas é a fonte confiável.
+    latest = get_latest_round() or {}
     actual_time = parse_time(latest.get("created_at"))
     age = (
         round((datetime.now(timezone.utc) - actual_time).total_seconds(), 3)
@@ -245,7 +241,13 @@ def freshness_snapshot():
 
 
 def pending_prediction():
-    documents = db.collection(PREDICTIONS).where("resolved", "==", False).get()
+    documents = (
+        db.collection(PREDICTIONS)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(50)
+        .get()
+    )
+    documents = [item for item in documents if item.to_dict().get("resolved") is False]
     if not documents:
         return None, None
     document = max(documents, key=lambda item: item.to_dict().get("created_at") or "")
@@ -1116,9 +1118,7 @@ def api_stats():
     try:
         state = state_data()
         total = int(state.get("total_rounds", 0))
-        current = state.get("current_prediction")
-        if not current:
-            _, current = pending_prediction()
+        _, current = pending_prediction()
         if current and current.get("predicted_color_name") == "escuro":
             current = {**current, "predicted_color_name": "preto"}
         return jsonify(
