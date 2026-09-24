@@ -18,6 +18,7 @@ from google.cloud import firestore
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("monitor-resultados-v2")
+APP_VERSION = "2026.09.24.4"
 
 JONBET_URL = os.getenv(
     "JONBET_URL",
@@ -44,7 +45,9 @@ MAX_TARGET_LAG_SECONDS = max(5.0, float(os.getenv("MAX_TARGET_LAG_SECONDS", "15"
 MIN_PREDICTION_LEAD_SECONDS = max(
     1.0, float(os.getenv("MIN_PREDICTION_LEAD_SECONDS", "2"))
 )
-BACKGROUND_COLLECTOR = os.getenv("BACKGROUND_COLLECTOR", "true").lower() in ("1", "true", "yes", "on")
+# O monitor normal já desperta o V2 a cada coleta. Manter outro ciclo interno
+# no V2 criava duas coletas concorrentes e uma fila permanente de requisições.
+BACKGROUND_COLLECTOR = os.getenv("V2_BACKGROUND_COLLECTOR", "false").lower() in ("1", "true", "yes", "on")
 COLLECT_LOCK = threading.Lock()
 COLLECTOR_STARTED = False
 STATS_CACHE_LOCK = threading.Lock()
@@ -436,7 +439,13 @@ def _resolve_prediction(document, prediction, available_rounds):
 def resolve_pending_prediction(available_rounds):
     if not available_rounds:
         return None
-    documents = db.collection(PREDICTIONS).where("resolved", "==", False).get()
+    documents = (
+        db.collection(PREDICTIONS)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(40)
+        .get()
+    )
+    documents = [item for item in documents if item.to_dict().get("resolved") is False]
     resolved = []
     for document in sorted(
         documents,
@@ -1089,6 +1098,7 @@ def health():
         return jsonify(
             status="online" if freshness["fresh"] else "degraded",
             service="monitor-resultados-v2",
+            version=APP_VERSION,
             time=utc_now(),
             freshness=freshness,
         )
